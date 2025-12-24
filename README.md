@@ -12,3 +12,9 @@ make
 ./ankaboot -d ./public -p 1300
 ```
 
+# Build and run using docker/podman
+
+```
+docker build -t ankaboot .
+docker run --rm -ti --net host -u $UID -v $PWD/public:/app/public ankaboot
+```
