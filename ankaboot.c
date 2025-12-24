@@ -10,6 +10,8 @@
 #include <sys/sendfile.h>
 #include <netinet/in.h>
 #include <fcntl.h>
+#include <poll.h>
+#include <signal.h>
 
 // this is linux specific not available on other OSes like BSD or MacOS
 #include <sys/epoll.h>
@@ -18,10 +20,11 @@
 #define BACKLOG 32767
 #define MAX_EVENTS 32767
 
-int recv_buffer_size=0, send_buffer_size=0, htdocs_dir_size=0;
+int recv_buffer_size=0, send_buffer_size=0;
+size_t htdocs_dir_size=0;
 char *htdocs_dir=NULL;
 int mime_n = 13;
-int max_ext_size = 7; // a dot + 5 chars + '\0'
+size_t max_ext_size = 7; // a dot + 5 chars + '\0'
 char mime_types[][2][32] = {
     {".html", "text/html"},
     {".htm", "text/html"},
@@ -90,6 +93,75 @@ int get_listen_socket(int port_num) {
 #define MIN(a,b) (((a)<(b))?(a):(b))
 #define MAX(a,b) (((a)>(b))?(a):(b))
 
+int wait_writable(int fd) {
+    struct pollfd pfd;
+    pfd.fd = fd;
+    pfd.events = POLLOUT;
+    for (;;) {
+        int rc = poll(&pfd, 1, -1);
+        if (rc > 0) {
+            if (pfd.revents & (POLLERR | POLLHUP | POLLNVAL)) {
+                return -1;
+            }
+            return 0;
+        }
+        if (rc == -1 && errno == EINTR) {
+            continue;
+        }
+        return -1;
+    }
+}
+
+int send_all(int fd, const char *buf, size_t len) {
+    size_t sent = 0;
+    while (sent < len) {
+        ssize_t n = send(fd, buf + sent, len - sent, MSG_NOSIGNAL);
+        if (n > 0) {
+            sent += (size_t)n;
+            continue;
+        }
+        if (n == 0) {
+            return -1;
+        }
+        if (errno == EINTR) {
+            continue;
+        }
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            if (wait_writable(fd) < 0) {
+                return -1;
+            }
+            continue;
+        }
+        return -1;
+    }
+    return 0;
+}
+
+int sendfile_all(int out_fd, int in_fd, off_t file_size) {
+    off_t offset = 0;
+    while (offset < file_size) {
+        size_t remaining = (size_t)(file_size - offset);
+        ssize_t n = sendfile(out_fd, in_fd, &offset, remaining);
+        if (n > 0) {
+            continue;
+        }
+        if (n == 0) {
+            return -1;
+        }
+        if (errno == EINTR) {
+            continue;
+        }
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            if (wait_writable(out_fd) < 0) {
+                return -1;
+            }
+            continue;
+        }
+        return -1;
+    }
+    return 0;
+}
+
 void send_400(int conn_sock) {
     const char *response =
         "HTTP/1.1 400 Bad Request\r\n"
@@ -97,15 +169,15 @@ void send_400(int conn_sock) {
         "Content-Length: 11\r\n"
         "\r\n"
         "Bad Request";
-    send(conn_sock, response, strlen(response), 0);
+    send_all(conn_sock, response, strlen(response));
     close(conn_sock);
 }
 
-long fd_size(int fd) {
+off_t fd_size(int fd) {
     struct stat statbuf;
     if (fstat(fd, &statbuf)) {
         perror("fstat");
-        return -1;
+        return (off_t)-1;
     }
     return statbuf.st_size;
 }
@@ -162,12 +234,12 @@ void handle_one(int conn_sock) {
         return;
     }
     // construct full pathname
-    char pathname_size = htdocs_dir_size + uri_size + 1;
+    size_t pathname_size = htdocs_dir_size + (size_t)uri_size + 1;
     char pathname[pathname_size];
     memcpy(pathname, htdocs_dir, htdocs_dir_size);
     // uri already contains the leading '/'
-    memcpy(pathname + htdocs_dir_size, uri, uri_size);
-    pathname[htdocs_dir_size + uri_size] = '\0';
+    memcpy(pathname + htdocs_dir_size, uri, (size_t)uri_size);
+    pathname[htdocs_dir_size + (size_t)uri_size] = '\0';
     // fprintf(stderr, "** II ** full path: [%s]\n", pathname);
     int fd = open(pathname, O_RDONLY);
     if (fd == -1) {
@@ -176,31 +248,43 @@ void handle_one(int conn_sock) {
         send_400(conn_sock);
         return;
     }
-    long file_size = fd_size(fd);
+    off_t file_size = fd_size(fd);
     if (file_size == -1) {
         close(fd);
         send_400(conn_sock);
         return;
     }
     // hack to make guessing mime faster by sending only the last few chars of the path
-    char *path_part = pathname + MAX(0, pathname_size - max_ext_size);
+    size_t path_part_offset = 0;
+    if (pathname_size > max_ext_size) {
+        path_part_offset = pathname_size - max_ext_size;
+    }
+    char *path_part = pathname + path_part_offset;
     // fprintf(stderr, "** II ** path_part=[%s]\n", path_part);
     char *mime_type = get_mime_type(path_part);
     const char *template =
         "HTTP/1.1 200 OK\r\n"
         "Content-Type: %s\r\n"
-        "Content-Length: %d\r\n"
+        "Content-Length: %lld\r\n"
         "\r\n";
     char dst[send_buffer_size];
-    int size = snprintf(dst, send_buffer_size, template, mime_type, file_size);
+    int size = snprintf(dst, send_buffer_size, template, mime_type, (long long)file_size);
     if (size<0 || size>=send_buffer_size) {
         fprintf(stderr, "** EE ** response header too large\n");
         close(fd);
         send_400(conn_sock);
         return;
     }
-    send(conn_sock, dst, size, 0);
-    sendfile(conn_sock, fd, NULL, file_size);
+    if (send_all(conn_sock, dst, (size_t)size) < 0) {
+        close(fd);
+        close(conn_sock);
+        return;
+    }
+    if (sendfile_all(conn_sock, fd, file_size) < 0) {
+        close(fd);
+        close(conn_sock);
+        return;
+    }
     close(fd);
     close(conn_sock);
 }
@@ -240,7 +324,12 @@ void serve_forever(int port_num) {
                 handle_one(events[n].data.fd);
                 continue;
             }
-            while((conn_sock=accept4(listen_sock, (struct sockaddr *)&addr, &addrlen, SOCK_NONBLOCK))>0) {
+            while(1) {
+                addrlen = sizeof(addr);
+                conn_sock = accept4(listen_sock, (struct sockaddr *)&addr, &addrlen, SOCK_NONBLOCK);
+                if (conn_sock < 0) {
+                    break;
+                }
                 // fprintf(stderr, "** II ** accepted %d\n", conn_sock);
                 ev.events = EPOLLIN | EPOLLET;
                 ev.data.fd = conn_sock;
@@ -259,7 +348,8 @@ void serve_forever(int port_num) {
 
 int main(int argc, char *argv[]) {
     int port_num = 8080; // Default port number
-    char c;
+    signal(SIGPIPE, SIG_IGN);
+    int c;
     while ((c = getopt(argc, argv, "d:p:")) != -1) {
         switch (c) {
             case 'd':

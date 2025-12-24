@@ -42,6 +42,11 @@ docker build -t ankaboot .
 docker run --rm -ti --net host -u $UID -v $PWD/public:/app/public ankaboot
 ```
 
+On MacOS, run with:
+```
+docker run --rm -ti -p 8080:8080 -u $UID -v $PWD/public:/app/public ankaboot
+```
+
 ## Notes and limits
 - Serves files only; no directory listings.
 - GET only (no HEAD/OPTIONS).
