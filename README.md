@@ -43,7 +43,28 @@ docker run --rm -ti --net host -u $UID -v $PWD/public:/app/public ankaboot
 ```
 
 ## Notes and limits
-- Serves files only; no directory listings.
-- GET only (no HEAD/OPTIONS).
+
+- Serves files only; no directory listings (might be fixed soon).
+- GET only (no HEAD/OPTIONS, though might be fixed soon).
+- No range requests, public caching, tag, ..etc (might be fixed soon).
 - No TLS termination (put it behind a reverse proxy if needed).
 - Basic MIME types included: html, css, js, json, png, jpg, gif, svg, ico, pdf.
+
+## Benchmarks
+
+This tool can be compared with `busybox httpd` and `lighttpd` 
+
+```
+busybox httpd -f -h ./public -p 0.0.0.0:8001
+echo -e "server.port = 8002\nserver.document-root = \"$PWD/public\"\nserver.max-worker = 1" | lighttpd -D -f -
+```
+
+using `ab` and `siege`
+
+```
+ab -t 10 -c 100 http://127.0.0.1:8001/index.html
+siege -l siege.log -q -b -t 10s -c 100 http://127.0.0.1:8001/index.html
+```
+
+but instead of `index.html`, consider a larger file.
+
